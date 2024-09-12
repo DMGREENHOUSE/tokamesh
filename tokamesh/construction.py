@@ -628,3 +628,134 @@ def mesh_generator(
     R, z, triangles = remove_duplicate_vertices(R, z, triangles)
 
     return R, z, triangles
+
+
+
+def field_aligned_mesh_generator(
+    R_boundary,
+    z_boundary,
+    resolution=0.03,
+    edge_resolution=None,
+    edge_padding=0.75,
+    edge_max_area=1.1,
+    rotation=None,
+    field_aligned_points=None
+):
+    """
+    Generate a triangular mesh which fills the space inside a given boundary using a 2-stage
+    process. First, a mesh of equilateral triangles is created which fills the space up to a
+    chosen minimum distance from the boundary. An irregular mesh is then generated which fills
+    the space between the central equilateral mesh and the boundary. The two meshes are then
+    merged, and the resulting mesh is returned.
+
+    :param R_boundary: \
+        The major-radius values of the boundary as a 1D numpy array.
+
+    :param z_boundary: \
+        The z-height values of the boundary as a 1D numpy array.
+
+    :param resolution: \
+        The side-length of triangles in the central equilateral mesh.
+
+    :param edge_resolution: \
+        Sets the target area of triangles in the irregular edge mesh, which fills the space between
+        the central equilateral mesh and the boundary. The `Triangle` C-code, which is used to
+        generate the irregular mesh, will attempt to construct triangles with areas equal to that
+        of an equilateral triangle with side length ``edge_resolution``. If not specified, the value
+        passed as the ``resolution`` argument is used instead.
+
+    :param edge_padding: \
+        A multiplicative factor which defines the minimum allowed distance between a
+        vertex in the central equilateral mesh and the boundary such that
+        ``min_distance = edge_padding * resolution``. No vertices in the central equilateral
+        mesh will be closer to the boundary than ``min_distance``.
+
+    :param edge_max_area: \
+        A multiplicative factor which sets the maximum allowed area of triangles in the
+        irregular edge mesh, such that no triangle will have an area larger than
+        ``edge_max_area`` times the target area set by the ``edge_resolution`` argument.
+
+    :param rotation: \
+        Angle (in radians) by which the orientations of triangles in the central
+        equilateral mesh are rotated, relative to their default orientation.
+
+    :return: \
+        A tuple containing ``R_vert``, ``z_vert`` and ``triangles``.
+        ``R_vert`` is the major-radius of the vertices as a 1D array. ``z_vert`` the is
+        z-height of the vertices as a 1D array. ``triangles`` is a 2D array of integers
+        of shape ``(N,3)`` specifying the indices of the vertices which form each triangle
+        in the mesh, where ``N`` is the total number of triangles.
+    """
+    # build the central mesh
+    central_R, central_z, central_triangles = build_central_mesh(
+        R_boundary=R_boundary,
+        z_boundary=z_boundary,
+        resolution=resolution,
+        padding_factor=edge_padding,
+        rotation=rotation,
+    )
+
+    # now construct the boundary for the central mesh
+    boundaries = find_boundaries(central_triangles)
+    # if there are multiple boundaries, sort them by length
+    if len(boundaries) > 1:
+        boundaries = sorted(boundaries, key=lambda x: len(x))
+    central_boundary = boundaries[-1]
+    central_boundary = concatenate([central_boundary, atleast_1d(central_boundary[0])])
+
+    # now we have the boundary, we can build the edge mesh using triangle.
+    # prepare triangle inputs:
+    if edge_resolution is None:
+        edge_resolution = resolution
+    eq_area = (edge_resolution ** 2) * 0.25 * sqrt(3)
+    area_multiplier = edge_max_area
+
+    outer = (R_boundary, z_boundary)
+    inner = (central_R[central_boundary], central_z[central_boundary])
+    voids = [[inner[0].mean()], [inner[1].mean()]]
+
+    edges, edge_triangles = triangulate(
+        outer_boundary=outer,
+        inner_boundary=inner,
+        void_markers=voids,
+        max_area=eq_area * area_multiplier,
+    )
+
+    # combine the central and edge meshes
+    R = concatenate([central_R, edges[:, 0]])
+    z = concatenate([central_z, edges[:, 1]])
+    accepted_points = remove_inside(array([R, z]).T, field_aligned_points)
+
+    # combine the central, edge meshes and field_aligned_points
+    R = concatenate([accepted_points[:, 0], field_aligned_points[0].flatten()])
+    z = concatenate([accepted_points[:, 1], field_aligned_points[1].flatten()])
+
+    # use  Delaunay
+    from scipy.spatial import Delaunay
+    tri = Delaunay(array([R, z]).T)
+    triangles = tri.simplices
+    R, z, triangles = remove_duplicate_vertices(R, z, triangles)
+
+    return R, z, triangles
+
+def remove_inside(test_points, polygon_points):
+    import matplotlib.path as mplPath
+    print(polygon_points.shape)
+    # Find the polygon bounds
+    poly_bounds = []
+    for G in [polygon_points[0], polygon_points[1]]:
+        temp = []
+        for v in [G[:, 0], G[-1, :], (G[:, -1])[::-1], (G[0, :])[::-1]]:
+            temp.extend(list(v))
+        poly_bounds.append( array(temp) )
+    # Now check which points are inside or not
+    poly_bounds = array(poly_bounds).T
+
+    polygon = mplPath.Path(poly_bounds)
+    truths = array([polygon.contains_point(point) for point in test_points])
+    print(truths)
+    print(test_points)
+    accepted_points = test_points[~truths]
+    print(accepted_points)
+    return accepted_points
+

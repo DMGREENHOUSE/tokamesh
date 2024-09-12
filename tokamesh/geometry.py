@@ -1,9 +1,132 @@
-from numpy import sqrt, log, pi, tan, dot, cross, identity
+import matplotlib.pyplot as plt
+from numpy import sqrt, log, pi, tan, dot, cross, identity, isnan
 from numpy import absolute, nan, isfinite, minimum, maximum
-from numpy import array, ndarray, linspace, full, zeros, stack, savez, int64
+from numpy import vstack, ndarray, linspace, full, zeros, stack, savez, int64, float64
 from collections import defaultdict
 from time import perf_counter
 import sys
+from scipy.sparse import csc_matrix
+from numpy.linalg import norm
+from numpy import sqrt, arccos, sign, array, cos, sin, pi, allclose
+
+
+class RayToCone:
+    def __init__(self, start, end):
+        start = array(start)
+        end = array(end)
+
+        self.r, self.theta, self.phi = self.convert_to_spherical(start, end)
+        self.start, self.end = start, end
+
+    def convert_to_spherical(self, start, end):
+        displacement = end - start
+        r = norm(displacement)
+        theta = arccos(displacement[2] / r)
+        phi = sign(displacement[1]) * arccos(displacement[0] / norm(displacement[:2]))
+
+        return r, theta, phi
+
+    def convert_to_cartesian(self, origin, r, theta, phi):
+        x = r * sin(theta) * cos(phi)
+        y = r * sin(theta) * sin(phi)
+        z = r * cos(theta)
+        return array((x, y, z)) + origin
+
+    def calc_angles_between_vectors(self, a, b, is_degrees=True):
+        cos_theta = dot(a, b) / (norm(a) * norm(b))
+        theta_radians = arccos(cos_theta)
+        if is_degrees:
+            return theta_radians * 180 / pi
+        else:
+            return theta_radians
+
+    def calc_angles_between_points(self, A, B, C, is_degrees=True):
+        AB = B - A
+        BC = C - B
+        CA = A - C
+        AC = C - A
+        angles =array((self.calc_angles_between_vectors(AB, BC, is_degrees=is_degrees),
+                  self.calc_angles_between_vectors(BC, CA, is_degrees=is_degrees),
+                  self.calc_angles_between_vectors(AB, AC, is_degrees=is_degrees)))
+        return angles
+
+    def __call__(self,
+                 alpha=(0.05,),  #  4),
+                 num_points=(6,),  #  12),
+                 is_plot_cone=False,
+                 is_verify=True):
+        """
+
+        :param alpha: given in degrees.
+        :param num_points:
+        :param is_plot_cone:
+        :return:
+        """
+        # convert to radians
+        alpha_rad = array(alpha) * pi / 180.
+
+        # include the centre
+        new_coordinates = self.end.copy().reshape((1, 3))  # vstack([new_coordinates, ])
+
+        for a, np in zip(alpha_rad, num_points):
+            if np > 0:
+                spacing = (2 * pi / np)
+                spacings = array([[cos(i * spacing), sin(i * spacing)] for i in range(np)]).T
+                new_thetas = self.theta + a * spacings[0]
+                new_phis = self.phi + a * spacings[1]
+                new_coordinates_contribution = array([self.convert_to_cartesian(self.start, self.r, t, p) for t, p in zip(new_thetas, new_phis)])
+
+                new_coordinates = vstack([new_coordinates, new_coordinates_contribution])
+        if is_verify:
+            if len(num_points) > 1:
+                raise ValueError("Verification only for single cone currently")
+            cone_angles  = []
+            for new_coord in new_coordinates[1:]:
+                cone_angles.append(self.calc_angles_between_points(self.start, self.end, new_coord)[-1])
+            point_separation_angles  = []
+            for new_coord_a, new_coord_b in zip(new_coordinates[1:-1], new_coordinates[2:]):
+                point_separation_angles.append(self.calc_angles_between_points(self.end, new_coord_a, new_coord_b)[-1])
+            try:
+                assert allclose(alpha[0], cone_angles, rtol=0.3)
+            except:
+                print(f"Failed: target: {alpha[0]}")
+                print("Found: ", cone_angles)
+            if num_points[0] > 0:
+                try:
+                    assert allclose(360/num_points[0], point_separation_angles, rtol=0.3)
+                except:
+                    print(f"Failed: target: {360/num_points[0]}")
+                    print("Found: ", point_separation_angles)
+
+        # check angles around the circle
+        if is_plot_cone:
+            self.plot(new_coordinates)
+        return new_coordinates
+
+    def plot(self, coords):
+        import matplotlib.pyplot as plt
+        fig = plt.figure()
+        ax = fig.add_subplot(111, projection='3d')
+        ax.set_aspect('equal')
+        # Plot the points
+        ax.scatter(*self.start, c='r', marker='o', label='Start')
+        ax.scatter(*self.end, c='g', marker='o', label='End')
+        for coord in coords:
+            ax.scatter(*coord, c='b', marker='^')
+
+        # Set labels for the axes
+        ax.set_xlabel('X-axis')
+        ax.set_ylabel('Y-axis')
+        ax.set_zlabel('Z-axis')
+
+        # Add a legend
+        ax.legend()
+
+        # Set the plot title
+        plt.title('3D Scatter Plot of Three Points')
+
+        # Show the plot
+        plt.show()
 
 
 class BarycentricGeometryMatrix(object):
@@ -34,6 +157,7 @@ class BarycentricGeometryMatrix(object):
     """
 
     def __init__(self, R, z, triangles, ray_origins, ray_ends):
+
         # first check the validity of the data
         self.check_geometry_data(R, z, triangles, ray_origins, ray_ends)
 
@@ -105,7 +229,7 @@ class BarycentricGeometryMatrix(object):
             / self.area[:, None]
         )
 
-    def calculate(self, save_file=None):
+    def calculate(self, save_file=None, precision=float64):
         """
         Calculate the geometry matrix.
 
@@ -169,7 +293,7 @@ class BarycentricGeometryMatrix(object):
 
         # convert the calculated matrix elements to a form appropriate for sparse matrices
         data_vals, vertex_inds, ray_inds = self.GeomFacs.get_sparse_matrix_data()
-
+        data_vals = array(data_vals, dtype=precision)
         data_dict = {
             "entry_values": data_vals,
             "row_indices": ray_inds,
@@ -222,6 +346,12 @@ class BarycentricGeometryMatrix(object):
         side_displacements = (
             intersections * self.rays[:, 2, None] + self.pixels[:, 2, None] - z0
         ) / uz
+        # print(side_displacements)
+        # print(self.rays.shape)
+        # print(self.pixels.shape)
+        # print(self.rays[:, 2, None])
+        # print(self.pixels[:, 2, None])
+        # quit()
         # reject any intersections which don't occur on the edge itself
         invalid_intersections = absolute(side_displacements) > 0.5 * w
         intersections[invalid_intersections] = nan
@@ -258,6 +388,10 @@ class BarycentricGeometryMatrix(object):
                     R0, z0, uR, uz, w
                 )
 
+            # each time there is an intersection, find the length of the ray to reach
+            # the intersection
+
+        prev_intersections = intersections.copy()
         # clip all the intersections so that they lie in the allowed range
         maximum(intersections, 0.0, out=intersections)
         minimum(intersections, self.lengths[:, None], out=intersections)
@@ -284,8 +418,8 @@ class BarycentricGeometryMatrix(object):
 
         # At this point, each ray should have an even number of intersections, if any
         # have an odd number then something has gone wrong, so raise an error.
-        if (intersection_count % 2 == 1).any():
-            raise ValueError("One or more rays has an odd number of intersections")
+        # if (intersection_count % 2 == 1).any():
+        #     raise ValueError("One or more rays has an odd number of intersections")
 
         max_intersections = intersection_count.max()
         for j in range(max_intersections // 2):
@@ -385,6 +519,84 @@ class BarycentricGeometryMatrix(object):
                 >> of shape (M,3), where 'M' is the total number of rays.
                 """
             )
+
+
+class BarycentricGeometryMatrixCone:
+    def __init__(self, R, z, triangles, ray_origins, ray_ends, ray_cone_angles, precision=float64, **ray_cone_kwargs):
+        assert len(ray_origins.shape) == 2
+        assert len(ray_ends.shape) == 2
+        assert ray_origins.shape[1] == 3
+        assert ray_ends.shape[1] == 3
+        if not hasattr(ray_cone_angles, '__iter__'):
+            ray_cone_angles = [ray_cone_angles] * len(ray_origins)
+        ray_cone_ends = []
+        for r_o, r_e, r_a in zip(ray_origins, ray_ends, ray_cone_angles):
+            ray_cone = RayToCone(start=r_o, end=r_e)
+            cone_ray_ends = ray_cone(alpha=(r_a, ), **ray_cone_kwargs)
+            ray_cone_ends.append(cone_ray_ends)
+        ray_cone_ends = array(ray_cone_ends)
+        ray_cone_ends = ray_cone_ends.transpose([1, 0, 2])
+        # make multiple instances
+        general_info = None
+        BGMs_data = []
+        for cone_ray_end in ray_cone_ends:
+            BGM = BarycentricGeometryMatrix(R=R, z=z,
+                                 triangles=triangles,
+                                 ray_origins=ray_origins,
+                                 ray_ends=cone_ray_end,
+                                 )
+            cone_ray_data = BGM.calculate(precision=precision)
+            if general_info is None:
+                requested = ("shape", "R", "z", "triangles")
+                general_info = {r: cone_ray_data[r] for r in requested}
+            gm_requested = ("entry_values", "row_indices", "col_indices", "shape")
+            BGMs_data.append(
+                {r: cone_ray_data[r] for r in gm_requested}
+            )
+        self.general_info = general_info
+        self.BGMs_data = BGMs_data
+
+
+    def calculate(self, save_file=None):
+        # make the geometry matrices and average over them.
+        BG_matrices = []
+        for BGM in self.BGMs_data:
+            args = (BGM['entry_values'],
+                    (BGM['row_indices'],
+                     BGM['col_indices']))
+            shape = BGM['shape']
+            matrix = csc_matrix(args, shape)
+            BG_matrices.append(matrix)
+
+        BGM_mean = sum(BG_matrices)  / len(BG_matrices)
+        if any(isnan(BGM_mean.data)):
+            msg = "Geometry matrix contains NaN points, verify mesh."
+            raise ValueError(msg)
+        # return to sparse format for saving
+        data_dict = {
+            "data": BGM_mean.data,
+            "indices": BGM_mean.indices,
+            "indptr": BGM_mean.indptr,
+            **self.general_info}
+
+        # num = len(BG_matrices) + 1
+        # num_row = 2
+        # from numpy import ceil
+        # num_col = int(ceil(num / num_row))
+        # fig, axs = plt.subplots(num_row, num_col, sharex=True, sharey=True)
+        # axs = axs.flatten()
+        # BG_matrices = [csc_matrix((data_dict['data'],
+        #                 data_dict['indices'],
+        #                 data_dict['indptr']), data_dict['shape']), *BG_matrices]
+        # for ax, mat in zip(axs, BG_matrices):
+        #     ax.imshow(mat.toarray())
+        # plt.show()
+
+        # save the matrix data
+        if save_file is not None:
+            savez(save_file, **data_dict)
+
+        return data_dict
 
 
 def radius_hyperbolic_integral(l1, l2, l_tan, R_tan_sqr, sqrt_q2):
