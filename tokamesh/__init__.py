@@ -824,7 +824,7 @@ class FieldAlignedMesh(TriangularMesh):
             self.poloidal_component = None
             self.poloidal_component = None
         else:
-            self.poloidal_component = abs(self.B[0] / (self.B[0]**2 + self.B[1]**2))
+            self.poloidal_component = abs(self.B[0] / sqrt(self.B[0]**2 + self.B[1]**2))
         self.upstream_indices = self.index_grid[0]
         self.downstream_indices = self.index_grid[-1]
         self.private_boundary_indices = self.index_grid[:, 0]
