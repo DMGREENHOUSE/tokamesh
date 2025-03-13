@@ -184,6 +184,7 @@ class TriangularMesh(object):
         :return: \
             The interpolated function values as a numpy array.
         """
+        vertex_values = self.handle_vertex_values(vertex_values)
         if type(vertex_values) is not ndarray or vertex_values.ndim != 1:
             raise TypeError(
                 """\n
@@ -376,11 +377,11 @@ class TriangularMesh(object):
     def get_field_image(self, vertex_values, shape=(250, 250),
                         pad_fraction=0.01,
                         ax=None,
-                        is_draw_limit=True,
-                        is_draw_separatrix=True,
+                        is_draw_limit=False,
+                        is_draw_separatrix=False,
                         connection_length_args = None,
                         te_front_args = None,
-                        is_shade_out_of_mwi=True,
+                        is_shade_out_of_mwi=False,
                         R_extent=None,
                         z_extent=None,
                         resolution=None,
@@ -405,6 +406,7 @@ class TriangularMesh(object):
             ``field_image`` is a 2D array of the interpolated field values. Any points outside
             the mesh are assigned a value of zero.
         """
+        vertex_values = self.handle_vertex_values(vertex_values)
         if R_extent is None:
             R_pad = (self.R_limits[1] - self.R_limits[0]) * pad_fraction
             r_min = self.R_limits[0] - R_pad
@@ -465,7 +467,7 @@ class TriangularMesh(object):
             if is_draw_separatrix and hasattr(self, 'psi'):
                 # sep_inds = argwhere(self.psi == 1.)
                 ax.plot(self.R[self.separatrix_inds], self.z[self.separatrix_inds], lw=2, alpha=0.5,
-                        color='white', linestyle='dashed', label='Separatrix')
+                        color='gray', linestyle='dashed', label='Separatrix')
             if connection_length_args is not None and hasattr(self, 'index_grid'):
                 default = {'value': 1.,
                            'field': self.parallel_distance,
@@ -694,12 +696,29 @@ class TriangularMesh(object):
         savez(filepath, R=self.R, z=self.z, triangles=self.triangle_vertices)
 
     @classmethod
-    def load(cls, filepath):
-        D = load(filepath)
-        return cls(R=D['R'], z=D['z'], triangles=D['triangles'])
+    def load(cls, data: (str, Group, dict)):
+        if isinstance(data, str):
+            mesh = cls._load_from_file_path(data)
+        elif isinstance(data, Group):
+            mesh = cls._load_from_h5_group(data)
+        elif isinstance(data, dict):
+            mesh = cls._load_from_dictionary(data)
+        else:
+            msg = f"Unrecognised data type: {type(data)}"
+            raise TypeError(msg)
+        return mesh
 
     @classmethod
-    def load_from_h5_group(cls, file_group):
+    def _load_from_file_path(cls, filepath: str):
+        data = load(filepath, allow_pickle=True)
+        return cls._load_from_dictionary(data)
+
+    @classmethod
+    def _load_from_dictionary(cls, data: dict):
+        return cls(R=data['R'], z=data['z'], triangles=data['triangles'])
+
+    @classmethod
+    def _load_from_h5_group(cls, file_group):
         keys = ("R", "z", "triangles")
         data = {k: file_group[k][()] for k in keys}
         return cls(**data)
@@ -716,12 +735,12 @@ class TriangularMesh(object):
 
     def integrate_total_area(self,
                              vertex_values, is_total=True):
+        vertex_values = self.handle_vertex_values(vertex_values)
         # get the centre of each
         R = self.R[self.triangle_vertices].mean(axis=1)
         z = self.z[self.triangle_vertices].mean(axis=1)
         # note this could be done directly
         centre_vals = self.interpolate(R, z, vertex_values)
-        area = self.area
         area = self.triangle_area(self.R[self.triangle_vertices].T, self.z[self.triangle_vertices].T)
 
         if is_total:
@@ -731,9 +750,13 @@ class TriangularMesh(object):
 
     def integrate_total_volume(self,
                              vertex_values):
+        vertex_values = self.handle_vertex_values(vertex_values)
         # get the centre of each
         R = self.R[self.triangle_vertices].mean(axis=1)
         return (2. * np.pi * R * self.integrate_total_area(vertex_values, is_total=False)).sum(axis=0)
+
+    def handle_vertex_values(self, vertex_values):
+        return vertex_values
 
 
 def get_fd_coeffs(points, order=1):
@@ -765,6 +788,135 @@ class YQuantityOptions(Enum):
     PARALLEL_DISTANCE_FROM_X_POINT = "parallel distance (from x point)"
     PARALLEL_DISTANCE_FROM_DIVERTOR_ENTRANCE = "parallel distance (from divertor entrance)"
 
+
+def coarsen_field_aligned_mesh(base_mesh, step=2):
+    """
+    Create a new FieldAlignedMesh with half-resolution (or 1/step) in each dimension.
+    The first and last rows/columns of the index_grid are always kept to preserve boundaries.
+
+    :param base_mesh: FieldAlignedMesh object (see your code).
+    :param step: Subsampling factor for the interior points.
+    :return: A new, coarser FieldAlignedMesh.
+    """
+    # --- 1) Extract relevant arrays from base_mesh ---
+    R_old = base_mesh.R
+    z_old = base_mesh.z
+    psi_old = base_mesh.psi
+    pd_old = base_mesh.poloidal_distance
+    par_old = base_mesh.parallel_distance
+    index_grid_old = base_mesh.index_grid  # shape (nZ, nR)
+    triangles_old = base_mesh.triangle_vertices
+
+    # Some boundary logic: we keep the first & last row/column,
+    # and step through the interior.
+    nZ, nR = index_grid_old.shape
+    # Row indices to keep:
+    row_inds = [0] + list(range(1, nZ - 1, step)) + [nZ - 1]
+    # Column indices to keep:
+    col_inds = [0] + list(range(1, nR - 1, step)) + [nR - 1]
+
+    # --- 2) Build the new sub-grid (index_grid_coarse) ---
+    index_grid_coarse = index_grid_old[np.ix_(row_inds, col_inds)]
+    # shape: (len(row_inds), len(col_inds))
+
+    # --- 3) Collect all unique old vertex IDs that appear in index_grid_coarse ---
+    old_ids_kept = np.unique(index_grid_coarse.ravel())
+
+    # --- 4) Build a mapping old_id -> new_id (0..M-1) ---
+    old_to_new = {old_id: i for i, old_id in enumerate(old_ids_kept)}
+
+    # --- 5) Create new arrays R_coarse, z_coarse, etc. by selecting only old_ids_kept ---
+    # We'll reorder them in ascending order of the old ID (this is arbitrary but consistent).
+    # To do that, we can sort old_ids_kept if needed, or rely on the dict.
+    # Let's define an array of new length M:
+    M = len(old_ids_kept)
+    R_coarse = np.zeros(M, dtype=R_old.dtype)
+    z_coarse = np.zeros(M, dtype=z_old.dtype)
+    psi_coarse = np.zeros(M, dtype=psi_old.dtype)
+    pd_coarse = np.zeros(M, dtype=pd_old.dtype)
+    par_coarse = np.zeros(M, dtype=par_old.dtype)
+
+    # Sort old_ids_kept so we fill arrays in ascending ID order
+    old_ids_sorted = np.sort(old_ids_kept)
+    # We'll store old_id -> "array index" as well
+    for new_i, old_id in enumerate(old_ids_sorted):
+        R_coarse[new_i] = R_old[old_id]
+        z_coarse[new_i] = z_old[old_id]
+        psi_coarse[new_i] = psi_old[old_id]
+        pd_coarse[new_i] = pd_old[old_id]
+        par_coarse[new_i] = par_old[old_id]
+    if base_mesh.B is not None:
+        B_coarse = np.zeros((2, M), dtype=par_old.dtype)
+        B_coarse[0] = base_mesh.B[0, old_ids_sorted]
+        B_coarse[1] = base_mesh.B[1, old_ids_sorted]
+    else:
+        B_coarse = None
+    # But note: old_to_new might not map in sorted order.
+    # It's okay as long as we are consistent. We'll fix that by building:
+    sorted_old_to_new = {}
+    for new_i, old_id in enumerate(old_ids_sorted):
+        sorted_old_to_new[old_id] = new_i
+
+    # Remap index_grid_coarse to these new IDs
+    idx_coarse_remapped = np.vectorize(sorted_old_to_new.__getitem__)(index_grid_coarse)
+    nZc, nRc = idx_coarse_remapped.shape
+
+    # --- 3) Re-Triangulate the Coarse Grid ---
+    # We assume a structured rectangular grid, with 2 triangles per cell:
+    #   (i, j)   -- (i, j+1)
+    #     |   \         |
+    #   (i+1,j) -- (i+1,j+1)
+    # so each cell => triangles:
+    #  t1 = (v00, v01, v11)
+    #  t2 = (v00, v11, v10)
+
+    tri_list = []
+    for i in range(nZc - 1):
+        for j in range(nRc - 1):
+            v00 = idx_coarse_remapped[i, j]
+            v01 = idx_coarse_remapped[i, j + 1]
+            v10 = idx_coarse_remapped[i + 1, j]
+            v11 = idx_coarse_remapped[i + 1, j + 1]
+
+            # Triangle 1
+            tri_list.append([v00, v01, v11])
+            # Triangle 2
+            tri_list.append([v00, v11, v10])
+
+    triangles_coarse = np.array(tri_list, dtype=int)
+    # --- 7) Build a new FieldAlignedMesh with these coarser arrays ---
+    # Also pass along B, B_x_point, etc. if needed, in the same manner. For brevity, we skip them here.
+    # We do handle the poloidal_distance_upstream_to_x_point, etc. by reusing base_mesh's attribute.
+    # Up to you how to handle. Let's do a simple version:
+
+    # We'll define a dictionary of all needed arguments:
+    new_kwargs = dict(
+        R=R_coarse,
+        z=z_coarse,
+        triangles=triangles_coarse,
+        index_grid=idx_coarse_remapped,
+        psi=psi_coarse,
+        poloidal_distance=pd_coarse,
+        parallel_distance=par_coarse,
+        poloidal_distance_upstream_to_x_point=base_mesh.poloidal_distance_upstream_to_x_point,
+        parallel_distance_upstream_to_x_point=base_mesh.parallel_distance_upstream_to_x_point,
+        divertor_entrance_z=base_mesh.divertor_entrance_z,
+        B=B_coarse,
+        B_x_point=base_mesh.B_x_point,
+        B_mid_plane=base_mesh.B_mid_plane,
+        coarse_mapping=old_ids_sorted,
+    )
+    # If you have more or fewer attributes in your base_mesh,
+    # add them to new_kwargs as desired. Or use a loop to copy any relevant ones.
+
+    # Finally, construct a new FieldAlignedMesh
+    # from copy import copy
+    new_mesh = FieldAlignedMesh(**new_kwargs)
+    # Copy over any extra attributes from base_mesh if needed
+    # e.g., new_mesh.some_attribute = copy(base_mesh.some_attribute)
+    return new_mesh
+
+
 class FieldAlignedMesh(TriangularMesh):
 
     def __init__(self, R, z, triangles, index_grid,
@@ -775,6 +927,7 @@ class FieldAlignedMesh(TriangularMesh):
                  B = None,  # (poloidal, toroidal)
                  B_x_point = None,  # (poloidal, toroidal)
                  B_mid_plane = None,  # (poloidal, toroidal)
+                 coarse_mapping=None,
                  **kwargs
     ):
         """
@@ -797,6 +950,7 @@ class FieldAlignedMesh(TriangularMesh):
         :param connection_length_to_target:
         :param kwargs:
         """
+        self.coarse_mapping = coarse_mapping
         for key, value in kwargs.items():
             setattr(self, key, value)
         super(FieldAlignedMesh, self).__init__(R, z, triangles)
@@ -919,25 +1073,42 @@ class FieldAlignedMesh(TriangularMesh):
             },
         }
 
+    def handle_vertex_values(self, vertex_values):
+        if (self.coarse_mapping is None) or (len(vertex_values) == len(self.coarse_mapping)):
+            return vertex_values
+        elif len(vertex_values) >= self.coarse_mapping.max():
+            return vertex_values[self.coarse_mapping]
+        else:
+            msg = f"Unrecognised vertex_values shape: {vertex_values.shape}. Expected ({self.n_vertices}, ) or ({len(self.coarse_mapping)}, )."
+            raise ValueError(msg)
+
+    def interpolate_psi(self, R, z, **kwargs):
+        return self.interpolate(R, z, self.psi, **kwargs)
+
+
     def get_separatrix_poloidal_flux_expansion_relative_x_point(self):
         if (self.B_x_point is None) or (self.B is None):
             msg = "Please provide magnetic field details"
+            raise ValueError(msg)
         return (self.B_x_point[0] * self.B[1][self.separatrix_inds]) / (self.B[0][self.separatrix_inds] * self.B_x_point[1])
 
     def get_separatrix_poloidal_flux_expansion_relative_mid_plane(self):
         if (self.B_mid_plane is None) or (self.B is None):
             msg = "Please provide magnetic field details"
+            raise ValueError(msg)
         return (self.B_mid_plane[0] * self.B[1][self.separatrix_inds]) / (self.B[0][self.separatrix_inds] * self.B_mid_plane[1])
 
     def get_separatrix_total_flux_expansion_relative_x_point(self):
         if (self.B_x_point is None) or (self.B is None):
             msg = "Please provide magnetic field details"
+            raise ValueError(msg)
         return sqrt(self.B_x_point[0]**2 +  self.B_x_point[1]**2) / \
                sqrt(self.B[0][self.separatrix_inds]**2 + self.B[1][self.separatrix_inds]**2)
 
     def get_separatrix_total_flux_expansion_relative_mid_plane(self):
         if (self.B_mid_plane is None) or (self.B is None):
             msg = "Please provide magnetic field details"
+            raise ValueError(msg)
         return sqrt(self.B_mid_plane[0]**2 +  self.B_mid_plane[1]**2) / \
                sqrt(self.B[0][self.separatrix_inds]**2 + self.B[1][self.separatrix_inds]**2)
 
@@ -1159,29 +1330,33 @@ class FieldAlignedMesh(TriangularMesh):
         file_group.create_dataset("grazing_angle", data=self.grazing_angle)
 
     @classmethod
-    def load(cls, data: (str, Group, dict)):
+    def load(cls, data: (str, Group, dict), coarse_step: int=1):
         if isinstance(data, str):
-            return cls.load_from_file_path(data)
+            mesh = cls._load_from_file_path(data)
         elif isinstance(data, Group):
-            return cls.load_from_h5_group(data)
+            mesh = cls._load_from_h5_group(data)
         elif isinstance(data, dict):
-            return cls.load_from_dictionary(data)
+            mesh = cls._load_from_dictionary(data)
         else:
             msg = f"Unrecognised data type: {type(data)}"
             raise TypeError(msg)
+        if coarse_step > 1:
+            mesh = coarsen_field_aligned_mesh(mesh, step=coarse_step)
+
+        return mesh
 
     @classmethod
-    def load_from_file_path(cls, filepath: str):
+    def _load_from_file_path(cls, filepath: str):
         D = load(filepath, allow_pickle=True)
         return cls(**D)
 
     @classmethod
-    def load_from_h5_group(cls, file_group: Group):
+    def _load_from_h5_group(cls, file_group: Group):
         data = {k: v[()] for k, v in file_group.items()}
         return cls(**data)
 
     @classmethod
-    def load_from_dictionary(cls, data: dict):
+    def _load_from_dictionary(cls, data: dict):
         return cls(**data)
 
     def get_upstream_downstream_pairs(self):
@@ -1397,68 +1572,11 @@ class FieldAlignedMesh(TriangularMesh):
         # plt.show()
         return integrated_selection
 
-    # def integrate_from_target(self, values, is_parallel=True):
-    #     values = values[self.index_grid]
-    #     if is_parallel:
-    #         pd = self.parallel_distance[self.index_grid]
-    #     else:
-    #         pd = self.poloidal_distance[self.index_grid]
-    #     dl = pd[1:] - pd[:-1]
-    #     mid_vals = 0.5 * (values[1:] + values[:-1])
-    #     elements =  mid_vals * dl
-    #     # Sum from the final row
-    #     # Add a row of zeros at the end for the target
-    #     integral = np.vstack((
-    #          np.flip(np.cumsum(np.flip(elements, axis=0), axis=0), axis=0),
-    #          np.zeros((1, dl.shape[1]))
-    #     ))
-    #     return integral
-
     def integrate_volume(self,
                              vertex_values):
         toroidal_factor = 2. * pi * self.R
         poloidal_plane = self.vertex_width * self.vertex_height
         return vertex_values * toroidal_factor * poloidal_plane
-
-
-    def integrate_from_target(self, values, is_parallel=True,
-                              is_include_flux_expansion=False,
-                              is_use_corrected_psi=False,
-                              boundary_condition = 0.):
-        values = values[self.index_grid]
-        n_r, n_c = self.index_grid.shape
-        if is_parallel:
-            pd = self.parallel_distance[self.index_grid]
-        else:
-            pd = self.poloidal_distance[self.index_grid]
-        dl = pd[1:] - pd[:-1]
-        mid_vals = 0.5 * (values[1:] + values[:-1])
-        elements =  mid_vals * dl
-
-        if is_include_flux_expansion:
-            # total flux expansion
-            B_tot = sqrt(self.B[0]**2 + self.B[1]**2)[self.index_grid]
-
-            mid_B = 0.5 * (B_tot[1:] + B_tot[:-1])
-
-            elements /= mid_B
-
-            # start assuming boundary_condition
-            cummulative_integral = zeros(shape=(n_r, n_c))
-            cummulative_integral[-1] = boundary_condition
-            for i in range(0, n_r-1)[::-1]:
-                cummulative_integral[i] = B_tot[i] * (cummulative_integral[i+1]/B_tot[i] - elements[i])
-
-        else:
-
-            # Sum from the final row
-            # Add a row of zeros at the end for the target
-            cummulative_integral = np.vstack((
-                 np.flip(np.cumsum(np.flip(-elements, axis=0), axis=0), axis=0),
-                 np.ones((1, dl.shape[1]))*boundary_condition
-            ))
-
-        return self.flatten(cummulative_integral)
     
     def get_fx_vertices(self):
         # plt.plot(self.Seperatrix_Poloidal_Distance_to_Target, self.Seperatrix_Flux_Expansion)
@@ -1474,7 +1592,9 @@ class FieldAlignedMesh(TriangularMesh):
         return interp_fx(partners)
 
 
-    def integrate_from_upstream(self, values, is_parallel=True, is_include_flux_expansion=True, is_use_corrected_psi=True, boundary_condition=0.):
+    def integrate(self, values, is_parallel=True, is_include_flux_expansion=True,
+                  is_use_corrected_psi=True,
+                  upstream_boundary_condition=None, downstream_boundary_condition=None):
         values = values[self.index_grid]
         n_r, n_c = self.index_grid.shape
         if is_parallel:
@@ -1492,17 +1612,27 @@ class FieldAlignedMesh(TriangularMesh):
 
             # start assuming boundary_condition
             cummulative_integral = zeros(shape=(n_r, n_c))
-            cummulative_integral[0] = boundary_condition
             for i in range(n_r-1):
                 cummulative_integral[i+1] = B_tot[i+1] * (cummulative_integral[i]/B_tot[i] + elements[i])
 
         else:
             cummulative_integral = np.vstack((
                 # np.flip(np.cumsum(np.flip(elements, axis=0), axis=0), axis=0),
-                np.ones((1, dl.shape[1]))*boundary_condition,
+                np.zeros((1, dl.shape[1])),
                 np.cumsum(elements, axis=0)
             ))
+
+        if (upstream_boundary_condition is not None) and (downstream_boundary_condition is not None):
+            msg = "Upstream and Downstream boundary conditions cannot both be specified."
+            raise ValueError(msg)
+
+        if upstream_boundary_condition is not None:
+            cummulative_integral += upstream_boundary_condition
+        if downstream_boundary_condition is not None:
+            cummulative_integral += downstream_boundary_condition - cummulative_integral[-1]
+
         return self.flatten(cummulative_integral)
+
 
 
 

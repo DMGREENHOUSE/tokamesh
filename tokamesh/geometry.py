@@ -1,4 +1,5 @@
 import matplotlib.pyplot as plt
+import numpy as np
 from numpy import sqrt, log, pi, tan, dot, cross, identity, isnan
 from numpy import absolute, nan, isfinite, minimum, maximum
 from numpy import vstack, ndarray, linspace, full, zeros, stack, savez, int64, float64
@@ -557,7 +558,7 @@ class BarycentricGeometryMatrixCone:
         self.BGMs_data = BGMs_data
 
 
-    def calculate(self, save_file=None):
+    def calculate(self, save_file=None, ignore_nan=False):
         # make the geometry matrices and average over them.
         BG_matrices = []
         for BGM in self.BGMs_data:
@@ -569,7 +570,7 @@ class BarycentricGeometryMatrixCone:
             BG_matrices.append(matrix)
 
         BGM_mean = sum(BG_matrices)  / len(BG_matrices)
-        if any(isnan(BGM_mean.data)):
+        if ((not ignore_nan) and any(isnan(BGM_mean.data))):
             msg = "Geometry matrix contains NaN points, verify mesh."
             raise ValueError(msg)
         # return to sparse format for saving
