@@ -26,7 +26,7 @@ from numpy.linalg import solve
 from scipy.sparse import csc_matrix
 from scipy.special import factorial
 from itertools import product
-from scipy.integrate import simps
+from scipy.integrate import simpson as simps
 from tokamesh.intersection import edge_rectangle_intersection
 from tokamesh.geometry import build_edge_map
 from tokamesh.tokamaks import mastu_boundary
