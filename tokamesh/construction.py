@@ -1,15 +1,22 @@
-from numpy import sqrt, ceil, sin, cos, arctan2, diff, minimum, maximum
-from numpy import array, ones, zeros, full, linspace, arange, int64, concatenate
-from numpy import in1d, unique, isclose, nan, atleast_1d, intersect1d
+from numpy import sqrt, ceil, sin, cos, arctan2, diff, minimum, maximum, cumsum
+from numpy import array, ones, zeros, full, linspace, arange, concatenate, vstack
+from numpy import in1d, unique, isclose, nan, atleast_1d, intersect1d, meshgrid
+from numpy import int64, ndarray
 from warnings import warn
 
-from tokamesh.geometry import build_edge_map
-from tokamesh.triangle import triangulate
+from tokamesh.utilities import build_edge_map, map_edge_connections
+
+MeshData = tuple[ndarray, ndarray, ndarray]
+FloatPair = tuple[float, float]
 
 
 def equilateral_mesh(
-    R_range=(0, 1), z_range=(0, 1), resolution=0.1, rotation=None, pivot=(0, 0)
-):
+    R_range: FloatPair,
+    z_range: FloatPair,
+    resolution: float,
+    rotation: float = None,
+    pivot: FloatPair = (0.0, 0.0),
+) -> MeshData:
     """
     Construct a mesh from equilateral triangles which fills a rectangular region.
 
@@ -75,14 +82,16 @@ def equilateral_mesh(
     return x.flatten(), y.flatten(), array(triangle_inds)
 
 
-def rotate(R, z, angle, pivot):
+def rotate(R: ndarray, z: ndarray, angle: float, pivot: FloatPair):
     """Rotate the point `(R, z)` anti-clockwise by `angle` about the point `pivot`"""
     d = sqrt((R - pivot[0]) ** 2 + (z - pivot[1]) ** 2)
     theta = arctan2(z - pivot[1], R - pivot[0]) + angle
     return d * cos(theta) + pivot[0], d * sin(theta) + pivot[1]
 
 
-def trim_vertices(R, z, triangles, trim_bools):
+def trim_vertices(
+    R: ndarray, z: ndarray, triangles: ndarray, trim_bools: ndarray
+) -> MeshData:
     """
     Removes chosen vertices (and any triangles containing those vertices) from a mesh.
 
@@ -117,7 +126,7 @@ def trim_vertices(R, z, triangles, trim_bools):
     return R[vert_inds], z[vert_inds], trim_triangles
 
 
-class Polygon(object):
+class Polygon:
     """
     Class for evaluating whether a given point is inside a polygon,
     or the distance between it and the nearest point on the polygon.
@@ -129,26 +138,34 @@ class Polygon(object):
         The y-values of the polygon vertices as a 1D numpy array.
     """
 
-    def __init__(self, x, y):
+    def __init__(self, x: ndarray, y: ndarray):
         self.x = array(x)
         self.y = array(y)
+
+        if self.x.ndim != 1 or self.y.ndim != 1 or self.x.size != self.y.size:
+            raise ValueError(
+                f"""\n
+                \r[ Polygon error ]
+                \r>> The given 'x' and 'y' arguments should be 1D arrays
+                \r>> of equal size, but have shapes:
+                \r>> {self.x.shape} and {self.y.shape}
+                \r>> respectively.
+                """
+            )
+
+        if self.x.size < 3:
+            raise ValueError(
+                f"""\n
+                \r[ Polygon error ]
+                \r>> The given 'x' and 'y' arguments must specify at least
+                \r>> 3 vertices to form a valid polygon, but only {self.x.size}
+                \r>> were given.
+                """
+            )
+
         if (self.x[0] != self.x[-1]) or (self.y[0] != self.y[-1]):
             self.x = concatenate([self.x, atleast_1d(self.x[0])])
             self.y = concatenate([self.y, atleast_1d(self.y[0])])
-
-        self.n = len(x)
-
-        self.dx = diff(self.x)
-        self.dy = diff(self.y)
-        self.im = full(self.dx.size, fill_value=nan)
-        self.c = full(self.dx.size, fill_value=nan)
-        im_inds = (self.dy != 0.0).nonzero()[0]
-        c_inds = (self.dx != 0.0).nonzero()[0]
-        self.im[im_inds] = self.dx[im_inds] / self.dy[im_inds]
-        self.c[c_inds] = (
-            self.y[:-1][c_inds]
-            - self.x[:-1][c_inds] * self.dy[c_inds] / self.dx[c_inds]
-        )
 
         # pre-calculate the bounding rectangle of each edge for intersection testing
         self.x_upr = maximum(self.x[1:], self.x[:-1])
@@ -156,74 +173,109 @@ class Polygon(object):
         self.y_upr = maximum(self.y[1:], self.y[:-1])
         self.y_lwr = minimum(self.y[1:], self.y[:-1])
 
-        # normalise the unit vectors
-        self.lengths = sqrt(self.dx ** 2 + self.dy ** 2)
-        self.dx /= self.lengths
-        self.dy /= self.lengths
+        # get direction vector elements for each edge
+        self.u_x = diff(self.x)
+        self.u_y = diff(self.y)
+        # coefficients to calculate minimum distance to the line of each edge
+        length_sqr = self.u_x**2 + self.u_y**2
+        self.k_x = -self.u_x / length_sqr
+        self.k_y = -self.u_y / length_sqr
+        # coefficients to calculate intersections
+        self.coeff = full(self.u_x.size, fill_value=nan)
+        self.not_horizontal = self.u_y != 0.0
+        self.coeff[self.not_horizontal] = (
+            self.u_x[self.not_horizontal] / self.u_y[self.not_horizontal]
+        )
+        self.const = self.x[:-1] - self.y[:-1] * self.coeff
 
-        self.zero_im = self.im == 0.0
+    def is_inside(self, x: ndarray, y: ndarray) -> ndarray[bool]:
+        """
+        Checks whether given points are inside the polygon.
 
-    def is_inside(self, v):
-        x, y = v
-        k = (y - self.c) * self.im
+        :param x: \
+            The x-values of the points to check as a 1D ``numpy.ndarray``.
 
-        limits_check = (self.y_lwr < y) & (y < self.y_upr) & (x < self.x_upr)
-        isec_check = (x < k) | self.zero_im
-        intersections = (limits_check & isec_check).sum()
-        return True if intersections % 2 == 1 else False
+        :param y: \
+            The y-values of the points to check as a 1D ``numpy.ndarray``.
 
-    def distance(self, v):
-        x, y = v
-        dx = x - self.x[:-1]
-        dy = y - self.y[:-1]
+        :return: \
+            A 1D ``numpy.ndarray`` of booleans specifying whether each of the
+            given points is inside the polygon or not.
+        """
+        x = atleast_1d(x)
+        y = atleast_1d(y)
+        edge_x = y[:, None] * self.coeff[None, :] + self.const[None, :]
+        limits_check = (
+            (self.y_lwr[None, :] < y[:, None])
+            & (y[:, None] < self.y_upr[None, :])
+            & (x[:, None] < self.x_upr[None, :])
+        )
 
-        L = (dx * self.dx + dy * self.dy) / self.lengths
-        D = dx * self.dy - dy * self.dx
-        booles = (0 <= L) & (L <= 1)
+        isec_check = (x[:, None] < edge_x) & self.not_horizontal[None, :]
+        intersections = (limits_check & isec_check).sum(axis=1)
+        return intersections % 2 == 1
 
-        points_min = sqrt(dx ** 2 + dy ** 2).min()
+    def distance(self, x: ndarray, y: ndarray) -> ndarray[float]:
+        """
+        Calculates the distance between given points and the closest point on the polygon.
 
-        if booles.any():
-            perp_min = abs(D[booles]).min()
-            return min(perp_min, points_min)
-        else:
-            return points_min
+        :param x: \
+            The x-values of the points for which the distance is calculated
+            as a 1D ``numpy.ndarray``.
+
+        :param y: \
+            The y-values of the points for which the distance is calculated
+            as a 1D ``numpy.ndarray``.
+
+        :return: \
+            The distance between the given points and the closest point on the polygon
+            as a 1D ``numpy.ndarray``.
+        """
+        x = atleast_1d(x)
+        y = atleast_1d(y)
+        dx = self.x[None, :-1] - x[:, None]
+        dy = self.y[None, :-1] - y[:, None]
+        # find the distance (normalised to the edge length) along the line
+        # of the edge which minimises the distance to the point
+        L = dx * self.k_x[None, :] + dy * self.k_y[None, :]
+        # clip this distance so it stays within the edge
+        L = L.clip(0.0, 1.0)
+        # calculate the minimum distance to each edge, then return the minimum
+        # distance across all edges
+        dist_sqr = (dx + L * self.u_x[None, :]) ** 2 + (dy + L * self.u_y[None, :]) ** 2
+        return sqrt(dist_sqr.min(axis=1))
 
     def diagnostic_plot(self):
-
-        xmin = self.x.min()
-        xmax = self.x.max()
-        ymin = self.y.min()
-        ymax = self.y.max()
+        xmin, xmax = self.x.min(), self.x.max()
+        ymin, ymax = self.y.min(), self.y.max()
         xpad = (xmax - xmin) * 0.15
         ypad = (ymax - ymin) * 0.15
 
-        N = 200
+        N = 128
         x_ax = linspace(xmin - xpad, xmax + xpad, N)
         y_ax = linspace(ymin - ypad, ymax + ypad, N)
+        x_mesh, y_mesh = meshgrid(x_ax, y_ax, indexing="ij")
 
-        inside = zeros([N, N])
-        distance = zeros([N, N])
-        for i in range(N):
-            for j in range(N):
-                v = [x_ax[i], y_ax[j]]
-                inside[i, j] = self.is_inside(v)
-                distance[i, j] = self.distance(v)
+        inside = self.is_inside(x_mesh.flatten(), y_mesh.flatten())
+        distance = self.distance(x_mesh.flatten(), y_mesh.flatten())
+
+        inside.resize(x_mesh.shape)
+        distance.resize(x_mesh.shape)
 
         import matplotlib.pyplot as plt
 
         fig = plt.figure(figsize=(12, 4))
-        ax1 = fig.add_subplot(131)
+        ax1 = fig.add_subplot(1, 3, 1)
         ax1.contourf(x_ax, y_ax, inside.T)
         ax1.plot(self.x, self.y, ".-", c="white", lw=2)
         ax1.set_title("point is inside polygon")
 
-        ax2 = fig.add_subplot(132)
+        ax2 = fig.add_subplot(1, 3, 2)
         ax2.contourf(x_ax, y_ax, distance.T, 100)
         ax2.plot(self.x, self.y, ".-", c="white", lw=2)
         ax2.set_title("distance from polygon")
 
-        ax3 = fig.add_subplot(133)
+        ax3 = fig.add_subplot(1, 3, 3)
         ax3.contourf(x_ax, y_ax, (distance * inside).T, 100)
         ax3.plot(self.x, self.y, ".-", c="white", lw=2)
         ax3.set_title("interior point distance from polygon")
@@ -232,13 +284,13 @@ class Polygon(object):
         plt.show()
 
 
-def find_boundaries(triangles):
+def find_boundaries(triangles: ndarray) -> list[ndarray]:
     """
     Find all the boundaries of a given mesh.
 
     :param triangles: \
         A 2D numpy array of integers specifying the indices of the vertices which form
-        each of the triangles in the mesh. The array must have shape ``(N,3)`` where
+        each of the triangles in the mesh. The array must have shape ``(N, 3)`` where
         ``N`` is the total number of triangles.
 
     :return: \
@@ -251,15 +303,20 @@ def find_boundaries(triangles):
     boundary_edges_indices = (counts == 1).nonzero()[0]
     boundary_edges = edge_vertices[boundary_edges_indices, :]
 
-    # now create a map between an edge, and the other edges to which it's connected
-    boundary_connections = {}
-    for i in range(boundary_edges.shape[0]):
-        edges = (
-            (boundary_edges[i, 0] == boundary_edges)
-            | (boundary_edges[i, 1] == boundary_edges)
-        ).nonzero()[0]
-        boundary_connections[i] = [e for e in edges if e != i]
+    _, edges_per_vertex = unique(boundary_edges, return_counts=True)
+    if edges_per_vertex.max() > 2:
+        warn(
+            """\n
+            \r[ find_boundaries warning ]
+            \r>> The given mesh contains at least two sub-meshes which
+            \r>> are connected by only one vertex. Currently, it is not
+            \r>> guaranteed that find_boundaries will draw separate
+            \r>> boundaries for each sub-mesh.
+            """
+        )
 
+    # now create a map between an edge, and the other edges to which it's connected
+    boundary_connections = map_edge_connections(boundary_edges)
     # we use a set to keep track of which edges have already been used as part of a boundary
     unused_edges = {i for i in range(boundary_edges.shape[0])}
 
@@ -277,18 +334,6 @@ def find_boundaries(triangles):
             else:
                 break
         boundaries.append(boundary_edges_indices[current_boundary])
-
-    _, edges_per_vertex = unique(boundary_edges, return_counts=True)
-    if edges_per_vertex.max() > 2:
-        warn(
-            """
-            [ find_boundaries warning ]
-            >> The given mesh contains at least two sub-meshes which
-            >> are connected by only one vertex. Currently, it is not
-            >> guaranteed that this function will draw separate boundaries
-            >> for each sub-mesh - this will be addressed in future update.
-            """
-        )
 
     # Now we need to convert the boundaries from edge indices to vertex indices
     vertex_boundaries = []
@@ -313,8 +358,12 @@ def find_boundaries(triangles):
 
 
 def build_central_mesh(
-    R_boundary, z_boundary, resolution, padding_factor=1.0, rotation=None
-):
+    R_boundary: ndarray,
+    z_boundary: ndarray,
+    resolution: float,
+    padding_factor: float = 1.0,
+    rotation: float = None,
+) -> MeshData:
     """
     Generate an equilateral mesh which fills the space inside a given boundary,
     up to a chosen distance to the boundary edge.
@@ -353,26 +402,21 @@ def build_central_mesh(
             R_range=R_range, z_range=z_range, resolution=resolution
         )
     else:
-        rot_R, rot_z = rotate(R_boundary, z_boundary, -rotation, [0.0, 0.0])
+        rot_R, rot_z = rotate(R_boundary, z_boundary, -rotation, (0.0, 0.0))
         R_range = (rot_R.min() - pad, rot_R.max() + pad)
         z_range = (rot_z.min() - pad, rot_z.max() + pad)
         R, z, triangles = equilateral_mesh(
             R_range=R_range, z_range=z_range, resolution=resolution
         )
-        R, z = rotate(R, z, rotation, [0.0, 0.0])
+        R, z = rotate(R, z, rotation, (0.0, 0.0))
 
-    # remove all triangles which are too close to or inside walls
-    bools = array(
-        [
-            poly.is_inside(p) * poly.distance(p) < resolution * padding_factor
-            for p in zip(R, z)
-        ]
-    )
-
+    bools = poly.is_inside(R, z) * poly.distance(R, z) < resolution * padding_factor
     return trim_vertices(R, z, triangles, bools)
 
 
-def refine_mesh(R, z, triangles, refinement_bools):
+def refine_mesh(
+    R: ndarray, z: ndarray, triangles: ndarray, refinement_bools: ndarray
+) -> MeshData:
     """
     Refine a mesh by partitioning specified triangles into 4 sub-triangles.
     Triangles sharing one or more edges with those being refined will also
@@ -500,7 +544,7 @@ def refine_mesh(R, z, triangles, refinement_bools):
     return new_R, new_z, new_triangles
 
 
-def remove_duplicate_vertices(R, z, triangles):
+def remove_duplicate_vertices(R: ndarray, z: ndarray, triangles: ndarray) -> MeshData:
     R2 = R.copy()
     z2 = z.copy()
     # first, find duplicate vertices (including those which differ only by numerical error)
@@ -531,14 +575,15 @@ def remove_duplicate_vertices(R, z, triangles):
 
 
 def mesh_generator(
-    R_boundary,
-    z_boundary,
-    resolution=0.03,
-    edge_resolution=None,
-    edge_padding=0.75,
-    edge_max_area=1.1,
-    rotation=None,
-):
+    R_boundary: ndarray,
+    z_boundary: ndarray,
+    resolution: float,
+    edge_resolution: float = None,
+    edge_padding: float = 0.75,
+    edge_max_area: float = 1.1,
+    rotation: float = None,
+    central_mesh: MeshData = None,
+) -> MeshData:
     """
     Generate a triangular mesh which fills the space inside a given boundary using a 2-stage
     process. First, a mesh of equilateral triangles is created which fills the space up to a
@@ -556,11 +601,11 @@ def mesh_generator(
         The side-length of triangles in the central equilateral mesh.
 
     :param edge_resolution: \
-        Sets the target area of triangles in the irregular edge mesh, which fills the space between
-        the central equilateral mesh and the boundary. The `Triangle` C-code, which is used to
-        generate the irregular mesh, will attempt to construct triangles with areas equal to that
-        of an equilateral triangle with side length ``edge_resolution``. If not specified, the value
-        passed as the ``resolution`` argument is used instead.
+        Sets the target area of triangles in the irregular edge mesh, which fills the
+        space between the central equilateral mesh and the boundary. The `Triangle` C-code,
+        which is used to generate the irregular mesh, will attempt to construct triangles
+        with areas equal to that of an equilateral triangle with side length ``edge_resolution``.
+        If not specified, the value passed as the ``resolution`` argument is used instead.
 
     :param edge_padding: \
         A multiplicative factor which defines the minimum allowed distance between a
@@ -577,6 +622,12 @@ def mesh_generator(
         Angle (in radians) by which the orientations of triangles in the central
         equilateral mesh are rotated, relative to their default orientation.
 
+    :param central_mesh: \
+        Allows the central mesh to be specified directly rather than being generated
+        automatically. The central mesh data is specified as a tuple of numpy arrays
+        specifying the major radius of the vertices, the z-height of the vertices and
+        the indices of the triangles respectively.
+
     :return: \
         A tuple containing ``R_vert``, ``z_vert`` and ``triangles``.
         ``R_vert`` is the major-radius of the vertices as a 1D array. ``z_vert`` the is
@@ -585,177 +636,110 @@ def mesh_generator(
         in the mesh, where ``N`` is the total number of triangles.
     """
     # build the central mesh
-    central_R, central_z, central_triangles = build_central_mesh(
-        R_boundary=R_boundary,
-        z_boundary=z_boundary,
-        resolution=resolution,
-        padding_factor=edge_padding,
-        rotation=rotation,
-    )
+    if central_mesh is None:
+        central_R, central_z, central_triangles = build_central_mesh(
+            R_boundary=R_boundary,
+            z_boundary=z_boundary,
+            resolution=resolution,
+            padding_factor=edge_padding,
+            rotation=rotation,
+        )
+    else:
+        central_R, central_z, central_triangles = central_mesh
 
-    # now construct the boundary for the central mesh
+    # find all boundaries on the central mesh
     boundaries = find_boundaries(central_triangles)
-    # if there are multiple boundaries, sort them by length
-    if len(boundaries) > 1:
-        boundaries = sorted(boundaries, key=lambda x: len(x))
+    # if there is more than one boundary, then there are multiple sub-meshes
+    # pick the largest boundary, and discard any vertices which are outside of it
+    boundaries = sorted(boundaries, key=lambda x: len(x))
     central_boundary = boundaries[-1]
-    central_boundary = concatenate([central_boundary, atleast_1d(central_boundary[0])])
+    if len(boundaries) > 1:
+        # turn the boundary into a polygon to test if points are inside
+        poly = Polygon(x=central_R[central_boundary], y=central_z[central_boundary])
+
+        max_dist = resolution * 1e-2
+        outside = ~poly.is_inside(x=central_R, y=central_z)
+        far_enough = poly.distance(x=central_R, y=central_z) > max_dist
+        trim_vertex = outside & far_enough
+
+        # remove any vertices which are outside the boundary
+        central_R, central_z, central_triangles = trim_vertices(
+            central_R, central_z, central_triangles, trim_vertex
+        )
+
+        # re-calculate the boundary for the trimmed mesh
+        boundaries = find_boundaries(central_triangles)
+        # verify that there is now only one boundary
+        assert len(boundaries) == 1
+        central_boundary = boundaries[-1]
 
     # now we have the boundary, we can build the edge mesh using triangle.
     # prepare triangle inputs:
-    if edge_resolution is None:
-        edge_resolution = resolution
-    eq_area = (edge_resolution ** 2) * 0.25 * sqrt(3)
-    area_multiplier = edge_max_area
+    edge_resolution = resolution if edge_resolution is None else edge_resolution
+    eq_area = (edge_resolution**2) * 0.25 * sqrt(3)
 
-    outer = (R_boundary, z_boundary)
-    inner = (central_R[central_boundary], central_z[central_boundary])
-    voids = [[inner[0].mean()], [inner[1].mean()]]
+    outer = array([R_boundary[:-1], z_boundary[:-1]]).T
+    inner = array(
+        [central_R[central_boundary[:-1]], central_z[central_boundary[:-1]]]
+    ).T
 
-    edges, edge_triangles = triangulate(
+    # fixme - for non-convex boundaries taking the mean doesn't always work
+    voids = [[inner[:, 0].mean(), inner[:, 1].mean()]]
+
+    edge_R, edge_z, edge_triangles = build_edge_mesh(
         outer_boundary=outer,
         inner_boundary=inner,
         void_markers=voids,
-        max_area=eq_area * area_multiplier,
+        max_area=eq_area * edge_max_area,
     )
 
     # combine the central and edge meshes
-    R = concatenate([central_R, edges[:, 0]])
-    z = concatenate([central_z, edges[:, 1]])
+    R = concatenate([central_R, edge_R])
+    z = concatenate([central_z, edge_z])
     triangles = concatenate(
         [central_triangles, edge_triangles + central_R.size], axis=0
     )
     R, z, triangles = remove_duplicate_vertices(R, z, triangles)
 
+    # check that the final mesh has only one boundary
+    assert len(find_boundaries(triangles)) == 1
     return R, z, triangles
 
 
+def build_edge_mesh(
+    inner_boundary: ndarray,
+    outer_boundary: ndarray,
+    void_markers: ndarray,
+    max_area: float,
+) -> MeshData:
+    for b in [inner_boundary, outer_boundary]:
+        assert b.ndim == 2 and b.shape[1] == 2
+        assert b[0, 0] != b[-1, 0] or b[0, 1] != b[-1, 1]
 
-def field_aligned_mesh_generator(
-    R_boundary,
-    z_boundary,
-    resolution=0.03,
-    edge_resolution=None,
-    edge_padding=0.75,
-    edge_max_area=1.1,
-    rotation=None,
-    field_aligned_points=None
-):
-    """
-    Generate a triangular mesh which fills the space inside a given boundary using a 2-stage
-    process. First, a mesh of equilateral triangles is created which fills the space up to a
-    chosen minimum distance from the boundary. An irregular mesh is then generated which fills
-    the space between the central equilateral mesh and the boundary. The two meshes are then
-    merged, and the resulting mesh is returned.
+    inner_segments = build_segments(inner_boundary.shape[0])
+    outer_segments = build_segments(outer_boundary.shape[0])
 
-    :param R_boundary: \
-        The major-radius values of the boundary as a 1D numpy array.
-
-    :param z_boundary: \
-        The z-height values of the boundary as a 1D numpy array.
-
-    :param resolution: \
-        The side-length of triangles in the central equilateral mesh.
-
-    :param edge_resolution: \
-        Sets the target area of triangles in the irregular edge mesh, which fills the space between
-        the central equilateral mesh and the boundary. The `Triangle` C-code, which is used to
-        generate the irregular mesh, will attempt to construct triangles with areas equal to that
-        of an equilateral triangle with side length ``edge_resolution``. If not specified, the value
-        passed as the ``resolution`` argument is used instead.
-
-    :param edge_padding: \
-        A multiplicative factor which defines the minimum allowed distance between a
-        vertex in the central equilateral mesh and the boundary such that
-        ``min_distance = edge_padding * resolution``. No vertices in the central equilateral
-        mesh will be closer to the boundary than ``min_distance``.
-
-    :param edge_max_area: \
-        A multiplicative factor which sets the maximum allowed area of triangles in the
-        irregular edge mesh, such that no triangle will have an area larger than
-        ``edge_max_area`` times the target area set by the ``edge_resolution`` argument.
-
-    :param rotation: \
-        Angle (in radians) by which the orientations of triangles in the central
-        equilateral mesh are rotated, relative to their default orientation.
-
-    :return: \
-        A tuple containing ``R_vert``, ``z_vert`` and ``triangles``.
-        ``R_vert`` is the major-radius of the vertices as a 1D array. ``z_vert`` the is
-        z-height of the vertices as a 1D array. ``triangles`` is a 2D array of integers
-        of shape ``(N,3)`` specifying the indices of the vertices which form each triangle
-        in the mesh, where ``N`` is the total number of triangles.
-    """
-    # build the central mesh
-    central_R, central_z, central_triangles = build_central_mesh(
-        R_boundary=R_boundary,
-        z_boundary=z_boundary,
-        resolution=resolution,
-        padding_factor=edge_padding,
-        rotation=rotation,
+    triangle_inputs = dict(
+        vertices=vstack([outer_boundary, inner_boundary]),
+        segments=connect_segments([outer_segments, inner_segments]),
+        holes=void_markers,
     )
 
-    # now construct the boundary for the central mesh
-    boundaries = find_boundaries(central_triangles)
-    # if there are multiple boundaries, sort them by length
-    if len(boundaries) > 1:
-        boundaries = sorted(boundaries, key=lambda x: len(x))
-    central_boundary = boundaries[-1]
-    central_boundary = concatenate([central_boundary, atleast_1d(central_boundary[0])])
+    options = f"QPBzpqa{max_area:.12f}"
+    from triangle import triangulate
 
-    # now we have the boundary, we can build the edge mesh using triangle.
-    # prepare triangle inputs:
-    if edge_resolution is None:
-        edge_resolution = resolution
-    eq_area = (edge_resolution ** 2) * 0.25 * sqrt(3)
-    area_multiplier = edge_max_area
+    triangle_outputs = triangulate(triangle_inputs, options)
+    triangles = triangle_outputs["triangles"]
+    vertices = triangle_outputs["vertices"]
+    return vertices[:, 0], vertices[:, 1], triangles
 
-    outer = (R_boundary, z_boundary)
-    inner = (central_R[central_boundary], central_z[central_boundary])
-    voids = [[inner[0].mean()], [inner[1].mean()]]
 
-    edges, edge_triangles = triangulate(
-        outer_boundary=outer,
-        inner_boundary=inner,
-        void_markers=voids,
-        max_area=eq_area * area_multiplier,
-    )
+def build_segments(n: int) -> ndarray:
+    inds = arange(n)
+    return vstack([inds, inds + 1]).T % n
 
-    # combine the central and edge meshes
-    R = concatenate([central_R, edges[:, 0]])
-    z = concatenate([central_z, edges[:, 1]])
-    accepted_points = remove_inside(array([R, z]).T, field_aligned_points)
 
-    # combine the central, edge meshes and field_aligned_points
-    R = concatenate([accepted_points[:, 0], field_aligned_points[0].flatten()])
-    z = concatenate([accepted_points[:, 1], field_aligned_points[1].flatten()])
-
-    # use  Delaunay
-    from scipy.spatial import Delaunay
-    tri = Delaunay(array([R, z]).T)
-    triangles = tri.simplices
-    R, z, triangles = remove_duplicate_vertices(R, z, triangles)
-
-    return R, z, triangles
-
-def remove_inside(test_points, polygon_points):
-    import matplotlib.path as mplPath
-    print(polygon_points.shape)
-    # Find the polygon bounds
-    poly_bounds = []
-    for G in [polygon_points[0], polygon_points[1]]:
-        temp = []
-        for v in [G[:, 0], G[-1, :], (G[:, -1])[::-1], (G[0, :])[::-1]]:
-            temp.extend(list(v))
-        poly_bounds.append( array(temp) )
-    # Now check which points are inside or not
-    poly_bounds = array(poly_bounds).T
-
-    polygon = mplPath.Path(poly_bounds)
-    truths = array([polygon.contains_point(point) for point in test_points])
-    print(truths)
-    print(test_points)
-    accepted_points = test_points[~truths]
-    print(accepted_points)
-    return accepted_points
-
+def connect_segments(segments: list[ndarray]) -> ndarray:
+    lengths = [s.shape[0] for s in segments]
+    offsets = cumsum([0, *lengths[:-1]], dtype=int)
+    return vstack([s + d for s, d in zip(segments, offsets)])
