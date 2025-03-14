@@ -580,19 +580,6 @@ class BarycentricGeometryMatrixCone:
             "indptr": BGM_mean.indptr,
             **self.general_info}
 
-        # num = len(BG_matrices) + 1
-        # num_row = 2
-        # from numpy import ceil
-        # num_col = int(ceil(num / num_row))
-        # fig, axs = plt.subplots(num_row, num_col, sharex=True, sharey=True)
-        # axs = axs.flatten()
-        # BG_matrices = [csc_matrix((data_dict['data'],
-        #                 data_dict['indices'],
-        #                 data_dict['indptr']), data_dict['shape']), *BG_matrices]
-        # for ax, mat in zip(axs, BG_matrices):
-        #     ax.imshow(mat.toarray())
-        # plt.show()
-
         # save the matrix data
         if save_file is not None:
             savez(save_file, **data_dict)
