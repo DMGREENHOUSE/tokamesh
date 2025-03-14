@@ -13,6 +13,7 @@ from scipy.sparse import csc_matrix
 from numpy.linalg import norm
 from numpy import sqrt, arccos, sign, array, cos, sin, pi, allclose
 
+from tokamesh.utilities import build_edge_map, partition_triangles
 
 class RayToCone:
     def __init__(self, start, end):
