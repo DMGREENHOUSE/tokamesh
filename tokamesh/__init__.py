@@ -20,7 +20,7 @@ __all__ = ["__version__"]
 
 from numpy import searchsorted, stack, log2, floor, unique, atleast_1d, atleast_2d
 from numpy import arange, linspace, int64, full, zeros, meshgrid, ndarray, ones
-from numpy import empty, nan, isnan, argwhere, argsort, cross, pi
+from numpy import empty, nan, isnan, argwhere, argsort, cross, pi, ptp
 from numpy import savez, load, array, sqrt, mean, argmin, ones_like, zeros_like, tile
 from numpy.linalg import solve
 from scipy.sparse import csc_matrix
@@ -133,8 +133,8 @@ class TriangularMesh(object):
         # grid cell and all triangles which intersect it.
 
         # find an appropriate depth for each tree
-        R_extent = self.R[self.triangle_vertices].ptp(axis=1).mean()
-        z_extent = self.z[self.triangle_vertices].ptp(axis=1).mean()
+        R_extent = ptp(self.R[self.triangle_vertices], axis=1).mean()
+        z_extent = ptp(self.z[self.triangle_vertices], axis=1).mean()
         R_depth = max(
             int(floor(log2((self.R_limits[1] - self.R_limits[0]) / R_extent)))-1, 2
         )
