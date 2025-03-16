@@ -981,7 +981,7 @@ class GeometryCalculator:
 BarycentricGeometryMatrix = GeometryCalculator
 
 class BarycentricGeometryMatrixCone:
-    def __init__(self, R, z, triangles, ray_origins, ray_ends, ray_cone_angles, precision=float64, **ray_cone_kwargs):
+    def __init__(self, R, z, triangles, ray_origins, ray_ends, ray_cone_angles, **ray_cone_kwargs):
         assert len(ray_origins.shape) == 2
         assert len(ray_ends.shape) == 2
         assert ray_origins.shape[1] == 3
@@ -1004,7 +1004,7 @@ class BarycentricGeometryMatrixCone:
                                  ray_origins=ray_origins,
                                  ray_ends=cone_ray_end,
                                  )
-            cone_ray_data = BGM.calculate(precision=precision)
+            cone_ray_data = BGM.calculate()
             if general_info is None:
                 requested = ("shape", "R", "z", "triangles")
                 general_info = {r: cone_ray_data[r] for r in requested}
